@@ -2,7 +2,7 @@
 
 function show_help() {
     echo "作者: Casear"
-    echo "GitHub: https://github.com/CasearF"
+    echo "GitHub: https://github.com/CasearF/device-passthrough-tool"
     echo "这是一个自写的简单脚本，请谨慎使用。"
     echo ""
     echo ""
