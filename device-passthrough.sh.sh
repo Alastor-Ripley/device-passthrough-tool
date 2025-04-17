@@ -1,80 +1,102 @@
 #!/bin/bash
 
+# Function to display help information and the main menu
 function show_help() {
-    echo "作者: Casear"
+    echo "Author: Casear"
     echo "GitHub: https://github.com/CasearF/device-passthrough-tool"
-    echo "这是一个自写的简单脚本，请谨慎使用。"
+    echo "This is a simple script written by the author. Please use it with caution."
     echo ""
     echo ""
-    echo "请选择一个功能，输入对应的数字:"
-    echo "  1 - 查看储存设备"
-    echo "  2 - 查看pcie设备"
-    echo "  3 - 查看usb设备"
-    echo "  0 - 退出"
+    echo "Please select a function by entering the corresponding number:"
+    echo "  1 - View storage devices"
+    echo "  2 - View PCIe devices"
+    echo "  3 - View USB devices"
+    echo "  0 - Exit"
 }
 
+# Function to show and handle disk passthrough
 function show_disk() {
-    echo "以下是可用的硬盘设备："
+    echo "The following hard disk devices are available:"
+    # List block devices by ID, filter for symbolic links (^lrwxrwx), 
+    # keep only ata and nvme devices, print the target filename ($9),
+    # and exclude partitions (-v 'part')
     result=$(ls -l /dev/disk/by-id/ | grep '^lrwxrwxrwx' | grep -E 'ata-|nvme-' | awk '{print $9}' | grep -v 'part')
 
     if [ -z "$result" ]; then
-        echo "没有找到硬盘设备。"
+        echo "No hard disk devices found."
         return
     fi
 
+    # Set Internal Field Separator to newline to handle disk names correctly
     IFS=$'\n'
+    # Create an array of disk names
     disk_array=($result)
     i=1
 
+    # Loop through the array and display numbered options
     for disk in "${disk_array[@]}"; do
         echo "$i - $disk"
         ((i++))
     done
 
-    read -p "请输入要选择的硬盘编号: " selected_number
+    # Prompt user to select a disk number
+    read -p "Please enter the number of the hard disk to select: " selected_number
 
+    # Validate the user input
     if [[ "$selected_number" =~ ^[0-9]+$ ]] && [ "$selected_number" -gt 0 ] && [ "$selected_number" -le "${#disk_array[@]}" ]; then
+        # Get the selected disk name from the array (adjusting for 0-based index)
         selected_disk="${disk_array[$selected_number-1]}"
-        echo "你选择的硬盘设备是: $selected_disk"
-        read -p "请输入要直通的虚拟机编号: " selected_vm_id
+        echo "You have selected the hard disk device: $selected_disk"
+        # Prompt user for the target VM ID
+        read -p "Please enter the VM ID to pass through to: " selected_vm_id
+        # Echo the command that will be run (for user visibility)
         echo "qm set $selected_vm_id -sata2 /dev/disk/by-id/$selected_disk"
+        # Execute the Proxmox VE command to attach the disk to the VM as sata2
         result2=$(qm set $selected_vm_id -sata2 /dev/disk/by-id/$selected_disk)
+        # Display the output/result of the command
         echo $result2
     else
-        echo "无效的选择，请重新选择一个有效的编号。"
+        # Handle invalid input
+        echo "Invalid selection. Please choose a valid number again."
     fi
 }
 
+# Main menu loop function
 function show_menu() {
     while true; do
         echo ""
-        show_help
-        read -p "请输入你的选择 (0-3): " choice
+        show_help # Display the menu options
+        # Prompt user for their choice
+        read -p "Please enter your choice (0-3): " choice
 
+        # Validate if the input is a number
         if ! [[ "$choice" =~ ^[0-9]+$ ]]; then
-            echo "输入无效，请输入一个数字。"
-            continue
+            echo "Invalid input. Please enter a number."
+            continue # Loop again if input is not a number
         fi
 
+        # Process the user's choice
         case $choice in
         1)
-            show_disk
+            show_disk # Call the disk passthrough function
             ;;
         2)
-            echo "正在开发中..."
+            echo "Under development..." # Placeholder for PCIe devices
             ;;
         3)
-            echo "正在开发中..."
+            echo "Under development..." # Placeholder for USB devices
             ;;
         0)
-            echo "退出脚本。再见！"
-            exit 0
+            echo "Exiting script. Goodbye!"
+            exit 0 # Exit the script successfully
             ;;
         *)
-            echo "无效的选择，请输入一个数字，范围是 0 到 3。"
+            # Handle invalid numeric choices
+            echo "Invalid choice. Please enter a number between 0 and 3."
             ;;
         esac
     done
 }
 
+# Start the main menu
 show_menu
