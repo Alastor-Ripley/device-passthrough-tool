@@ -76,9 +76,21 @@ find_next_device_index() {
         return 1
     fi
 
-    # Grep for lines starting with the prefix followed by digits, extract the digits,
+    # Adjust grep pattern for hostpci which uses '--hostpciX' or '-hostpciX'
+    local grep_pattern
+    if [[ "$controller_prefix" == "hostpci" ]]; then
+        # Match --hostpci<num> or -hostpci<num> at the start of a line or after whitespace
+        grep_pattern="[[:space:]]*-{1,2}${controller_prefix}[0-9]+"
+    else
+        # Original pattern for disk/usb controllers (e.g., scsi0:, usb1:)
+        grep_pattern="^${controller_prefix}[0-9]+"
+    fi
+
+
+    # Grep for lines matching the pattern, extract the digits,
     # sort numerically in reverse order, take the first one (highest number)
-    last_idx=$(echo "$config" | grep -o "^${controller_prefix}[0-9]\+" | grep -o '[0-9]\+' | sort -nr | head -n 1)
+    last_idx=$(echo "$config" | grep -Eo "$grep_pattern" | grep -Eo '[0-9]+' | sort -nr | head -n 1)
+
 
     if [[ -z "$last_idx" ]]; then
         max_idx=-1 # No existing devices of this type found
@@ -114,14 +126,14 @@ ask_confirmation() {
 function show_help() {
     echo "-----------------------------------------------------"
     echo " Proxmox VE Device Passthrough Helper"
-    echo " Author: Casear (Original), Enhanced by AI"
-    echo " GitHub: https://github.com/CasearF/device-passthrough-tool"
+    echo " Author: Casear (Original), Enhanced by AI & User"
+    echo " GitHub: https://github.com/CasearF/device-passthrough-tool (Original)"
     echo " WARNING: Passthrough modifies VM configurations. Use with caution!"
     echo "-----------------------------------------------------"
     echo ""
     echo "Please select a function by entering the corresponding number:"
     echo "  1 - Passthrough Storage Device (Disk)"
-    echo "  2 - Passthrough PCIe Device"
+    echo "  2 - Passthrough PCIe Device (NVIDIA Filtered)"
     echo "  3 - Passthrough USB Device"
     echo "  0 - Exit"
     echo ""
@@ -185,6 +197,7 @@ function show_disk() {
     echo "Selected disk ID: $selected_disk_id"
 
     # Prompt for VM ID and validate
+    list_vms # Show available VMs
     read -rp "Enter the target VM ID: " selected_vm_id
     if ! validate_vm_id "$selected_vm_id"; then return 1; fi
 
@@ -221,19 +234,12 @@ function show_disk() {
     # Basic command construction - options like cache, iothread are added via GUI or qm set options separately if needed.
     qm_command="qm set $selected_vm_id -${controller_type}${device_index} /dev/disk/by-id/${selected_disk_id}"
 
-    # Example of adding options (optional - could be added here based on controller type or user prompt)
-    # local cmd_options=""
-    # if [[ "$controller_type" == "virtio" || "$controller_type" == "scsi" ]]; then
-    #     # Common options, user could be prompted for these
-    #     # cmd_options+=",cache=writeback,iothread=1" # Example
-    # fi
-    # qm_command+="$cmd_options"
-
-
+    echo "-----------------------------------------------------"
     echo "The following command will be executed:"
     echo "  $qm_command"
+    echo "-----------------------------------------------------"
 
-    if ask_confirmation; then
+    if ask_confirmation "Execute this command? (y/N): "; then
         echo "Executing command..."
         cmd_result=$(eval "$qm_command" 2>&1) # Use eval to handle potential options with commas if added later
         if [[ $? -eq 0 ]]; then
@@ -253,11 +259,12 @@ function show_disk() {
     fi
 }
 
-# Function to show and handle PCIe passthrough
+
+# Function to show and handle PCIe passthrough (FILTERED FOR NVIDIA)
 function show_pcie() {
-    echo "--- PCIe Device Passthrough ---"
+    echo "--- PCIe Device Passthrough (NVIDIA Only Filter) ---"
     echo "WARNING: PCIe passthrough is complex and requires proper IOMMU setup (BIOS/Kernel)!"
-    echo "WARNING: You pass through ALL devices in an IOMMU group together!"
+    echo "WARNING: You generally pass through ALL devices in an IOMMU group together!"
 
     if ! command_exists lspci || ! command_exists realpath; then
         error_exit "Required command not found (lspci, realpath)."
@@ -270,106 +277,200 @@ function show_pcie() {
          return 1
     fi
 
-    echo "Listing PCIe devices and their IOMMU groups..."
-    local -A pcie_devices # Map index number to BusID
+    echo "Scanning for NVIDIA PCIe devices and their IOMMU groups..."
+    local -A pcie_devices_map # Map display index number to BusID
     local count=1
-    local selected_index selected_busid selected_vm_id device_index group_num group_dev_links pcie_opt rombar_opt qm_command cmd_result
+    local nvidia_found=false # Flag to track if any NVIDIA devices were found
 
-    # Loop through groups and devices
+    # Use an array to store the display lines, makes sorting/management easier if needed later
+    declare -a display_list
+
+    # Loop through groups and devices to find NVIDIA hardware
     shopt -s nullglob # Prevent loop from running if no matches
     for group_dir in "$iommu_group_path"/*/; do
-        group_num=$(basename "$group_dir")
-        echo "--- IOMMU Group $group_num ---"
+        local group_num=$(basename "$group_dir")
+        local group_has_nvidia=false # Flag to print group header only if needed
+        local group_output_buffer="" # Temporarily store lines for this group
+
         for device_link in "$group_dir"/devices/*; do
-            busid=$(basename "$device_link")
+            local busid=$(basename "$device_link")
             # Use lspci -s to get info for this specific device ID, -nn to get vendor/product IDs
-            device_info=$(lspci -s "$busid" -nn | sed 's/^[0-9a-f.:]* //') # Remove busid prefix more reliably
-            display_line="[$group_num] $busid $device_info"
-            echo "  $count - $display_line"
-            pcie_devices[$count]="$busid" # Store BusID mapping
-            ((count++))
+            # Use grep -q to check exit status for NVIDIA match (case-insensitive)
+            local device_info
+            device_info=$(lspci -s "$busid" -nn) # Get full line first
+            if echo "$device_info" | grep -qi 'nvidia'; then
+                 # Found an NVIDIA device
+                 if ! $group_has_nvidia; then # Print group header only once when an NVIDIA device is found in it
+                     group_output_buffer+="--- IOMMU Group $group_num ---\n"
+                     group_has_nvidia=true
+                 fi
+                 nvidia_found=true # Mark that we found at least one NVIDIA device overall
+
+                 local cleaned_device_info=$(echo "$device_info" | sed 's/^[0-9a-f.:]* //') # Remove busid prefix for display
+                 local display_line="[$group_num] $busid $cleaned_device_info"
+                 group_output_buffer+="  $count - $display_line\n"
+                 pcie_devices_map[$count]="$busid" # Store BusID mapping
+                 ((count++))
+            fi
         done
+
+        # Add the buffered output for this group to the final display list if it contained NVIDIA devices
+         if $group_has_nvidia; then
+            display_list+=("$group_output_buffer")
+        fi
     done
     shopt -u nullglob # Restore default behavior
 
-    if [[ $count -eq 1 ]]; then
-        echo "No PCIe devices found in IOMMU groups."
+    # Check if any NVIDIA devices were found at all
+    if ! $nvidia_found; then
+        echo "-----------------------------------------------------"
+        echo "No NVIDIA PCIe devices found within active IOMMU groups."
+        echo "Please check:"
+        echo "  1. If your NVIDIA card is physically installed and powered."
+        echo "  2. If IOMMU is correctly enabled in BIOS/UEFI and kernel command line (e.g., intel_iommu=on or amd_iommu=on)."
+        echo "  3. Run 'lspci | grep -i nvidia' to see if the host OS detects the card."
+        echo "  4. Ensure the necessary vfio modules are loaded or can be loaded."
+        echo "-----------------------------------------------------"
         return 1
     fi
 
-    read -rp "Enter the number of the PCIe device to passthrough: " selected_index
-    if [[ ! "$selected_index" =~ ^[0-9]+$ ]] || [[ -z "${pcie_devices[$selected_index]}" ]]; then
-         error_exit "Invalid selection."
+    # Print the collected list of NVIDIA devices
+    echo "-----------------------------------------------------"
+    echo "Available NVIDIA PCIe devices for passthrough:"
+    for item in "${display_list[@]}"; do
+        printf "%b" "$item" # Use printf to correctly interpret newline characters (\n)
+    done
+    echo "-----------------------------------------------------"
+
+    # --- Device Selection ---
+    local selected_index selected_busid
+    read -rp "Enter the number corresponding to the NVIDIA device you want to pass through: " selected_index
+    # Validate input
+    if [[ ! "$selected_index" =~ ^[0-9]+$ ]] || [[ -z "${pcie_devices_map[$selected_index]}" ]]; then
+         error_exit "Invalid selection '$selected_index'. Please enter a number from the list above."
          return 1
     fi
-    selected_busid="${pcie_devices[$selected_index]}"
+    selected_busid="${pcie_devices_map[$selected_index]}"
 
-    # Find the group for the selected device again and list all devices in it
-    local real_path_link
+    # --- Confirm Selected Device ---
+    local selected_device_info=$(lspci -s "$selected_busid" -nn | sed 's/^[0-9a-f.:]* //')
+    echo "You selected: #$selected_index - $selected_busid ($selected_device_info)"
+
+    # --- Find IOMMU Group and Confirm Group Passthrough ---
+    local real_path_link group_num group_dev_links
     real_path_link=$(realpath "$iommu_group_path"/*/devices/"$selected_busid" 2>/dev/null)
     if [[ -z "$real_path_link" ]]; then
-        error_exit "Could not determine IOMMU group for selected device $selected_busid."
+        # This should ideally not happen if the device was listed, but check anyway
+        error_exit "Could not determine IOMMU group for selected device $selected_busid after selection."
         return 1
     fi
-    group_num=$(basename "$(dirname "$real_path_link")")
+    group_num=$(basename "$(dirname "$(dirname "$real_path_link")")") # Get the group number correctly
 
+    echo "-----------------------------------------------------"
     echo "Selected device $selected_busid is in IOMMU group $group_num."
-    echo "All devices in this group (will be passed through together):"
+    echo "IMPORTANT: All devices within the *same IOMMU group* might need to be passed through together,"
+    echo "or handled by the vfio-pci driver on the host. Review the full group:"
     group_dev_links=("$iommu_group_path/$group_num"/devices/*)
+    local contains_other_devices=false
     for dev_link in "${group_dev_links[@]}"; do
         local current_busid=$(basename "$dev_link")
         echo "  - $current_busid : $(lspci -s "$current_busid" -nn | sed 's/^[0-9a-f.:]* //')"
+        if [[ "$current_busid" != "$selected_busid" ]]; then
+            contains_other_devices=true
+        fi
     done
-    if ! ask_confirmation "WARNING: Pass through ALL devices listed above from group $group_num? (y/N): "; then
+    if $contains_other_devices; then
+      echo "Note: This group contains other devices besides the one you selected."
+    fi
+
+    if ! ask_confirmation "Proceed with passing through device $selected_busid (and potentially affecting others in group $group_num)? (y/N): "; then
         echo "Operation cancelled."
         return 1
     fi
+    echo "-----------------------------------------------------"
 
-    # Prompt for VM ID and validate
-    read -rp "Enter the target VM ID: " selected_vm_id
+    # --- Get Target VM ID ---
+    local selected_vm_id
+    list_vms # Show available VMs
+    read -rp "Enter the target VM ID to pass this device to: " selected_vm_id
     if ! validate_vm_id "$selected_vm_id"; then return 1; fi
 
-    # Find next available hostpci index
+    # --- Find Next Available PCI Slot in VM ---
+    local device_index
     device_index=$(find_next_device_index "$selected_vm_id" "hostpci")
      if [[ $? -ne 0 ]] || [[ -z "$device_index" ]]; then
-        error_exit "Could not determine next available hostpci index."
+        error_exit "Could not determine next available hostpci index for VM $selected_vm_id."
         return 1
     fi
-    echo "Using next available hostpci index: $device_index"
+    echo "Assigning to VM PCI slot index: hostpci$device_index"
 
-    # Ask for common options
-    pcie_opt=""
+    # --- Configure Passthrough Options ---
+    local pcie_opt="" rombar_opt="" primary_gpu_opt=""
     # Default to Yes for pcie=1 unless user explicitly says no
-    if ask_confirmation "Use PCIe mode (pcie=1)? (Recommended) (Y/n): " ; then
+    if ask_confirmation "Use PCIe specification (pcie=1)? (Recommended for most modern GPUs) (Y/n): " ; then
        pcie_opt=",pcie=1"
+       # Only ask about primary GPU if pcie=1 is chosen, as x-vga=1 requires it.
+       if ask_confirmation "Is this the PRIMARY display adapter for the VM? (Sets primary_gpu=1/x-vga=1) (y/N): "; then
+           # Check if VM already has a display device configured
+           local current_vga
+           current_vga=$(qm config "$selected_vm_id" | grep -o '^vga: .*')
+           if [[ -n "$current_vga" ]]; then
+              echo "Warning: VM $selected_vm_id already has a display adapter configured ($current_vga)."
+              echo "Setting this device as primary GPU (x-vga=1) might conflict or replace it."
+              if ! ask_confirmation "Continue setting this as the primary GPU (x-vga=1)? (y/N): "; then
+                 echo "Skipping primary GPU setting."
+              else
+                 primary_gpu_opt=",x-vga=1"
+                 echo "Setting as primary GPU (x-vga=1). You might need to remove/change the existing '$current_vga' setting manually."
+              fi
+           else
+              primary_gpu_opt=",x-vga=1"
+              echo "Setting as primary GPU (x-vga=1)."
+           fi
+       fi
     fi
 
-    rombar_opt=""
     # Default to Yes for rombar=0 unless user explicitly says no
-    if ask_confirmation "Disable ROM BAR (rombar=0)? (Often needed) (Y/n): "; then
+    if ask_confirmation "Disable ROM BAR (rombar=0)? (Often needed for NVIDIA GPUs) (Y/n): "; then
        rombar_opt=",rombar=0"
     fi
-    # Add primary GPU option later? Needs more logic (check for existing vga, use x-vga=1)
 
-    # Construct the command
-    qm_command="qm set $selected_vm_id -hostpci${device_index} ${selected_busid}${pcie_opt}${rombar_opt}"
 
+    # --- Construct and Confirm Command ---
+    local qm_command cmd_result
+    # Assemble the options string carefully, ensuring commas are only added if needed
+    local options=""
+    if [[ -n "$pcie_opt" ]]; then options+="$pcie_opt"; fi
+    if [[ -n "$rombar_opt" ]]; then options+="$rombar_opt"; fi
+    if [[ -n "$primary_gpu_opt" ]]; then options+="$primary_gpu_opt"; fi
+
+    # Construct the final command
+    qm_command="qm set $selected_vm_id --hostpci${device_index} ${selected_busid}${options}"
+
+    echo "-----------------------------------------------------"
     echo "The following command will be executed:"
     echo "  $qm_command"
+    echo "-----------------------------------------------------"
 
-    if ask_confirmation; then
+    # --- Execute Command ---
+    if ask_confirmation "Execute this command? (y/N): "; then
         echo "Executing command..."
-        # Note: This might require the VM to be stopped. qm set will usually error if not.
+        # Note: This usually requires the VM to be stopped. qm set will error if not.
         cmd_result=$(eval "$qm_command" 2>&1)
         if [[ $? -eq 0 ]]; then
             echo "Success!"
             if [[ -n "$cmd_result" ]]; then echo "Output: $cmd_result"; fi
-            echo "Note: Ensure required kernel modules (vfio, vfio_pci, etc.) are loaded on host."
-            echo "Note: You may need to blacklist the original driver for $selected_busid on the host."
-            echo "Note: VM needs to be fully stopped and started (not rebooted) for PCIe passthrough."
+            echo "--- Important Notes ---"
+            echo "* Ensure required kernel modules (vfio, vfio_pci, vfio_iommu_type1) are loaded on the Proxmox host."
+            echo "* You likely need to blacklist the default drivers (e.g., nouveau, nvidia) for '$selected_busid' on the host to prevent conflicts. (Check Proxmox documentation for vfio setup)."
+            echo "* The VM must be fully STOPPED and then STARTED (not rebooted) for PCIe passthrough changes to take effect."
+            if [[ -n "$primary_gpu_opt" ]]; then
+                echo "* Since you set this as the primary GPU, ensure the VM's OS has appropriate drivers installed. You may not see console output via the Proxmox web UI."
+            fi
+            echo "* Verify IOMMU group separation; passing through devices sharing a group with critical host hardware can cause instability."
         else
-            error_exit "Command failed with status $?."
-            if [[ -n "$cmd_result" ]]; then echo "Output: $cmd_result"; fi
+            error_exit "Command failed with status $?. Check VM state (should be stopped) and host configuration."
+            if [[ -n "$cmd_result" ]]; then echo "Output from failed command: $cmd_result"; fi
             return 1
         fi
     else
@@ -422,6 +523,7 @@ function show_usb() {
     echo "Selected USB ID: $selected_usb_id"
 
     # Prompt for VM ID and validate
+    list_vms # Show available VMs
     read -rp "Enter the target VM ID: " selected_vm_id
     if ! validate_vm_id "$selected_vm_id"; then return 1; fi
 
@@ -436,10 +538,12 @@ function show_usb() {
     # Construct the command (passthrough by ID)
     qm_command="qm set $selected_vm_id -usb${device_index} host=${selected_usb_id}"
 
+    echo "-----------------------------------------------------"
     echo "The following command will be executed:"
     echo "  $qm_command"
+    echo "-----------------------------------------------------"
 
-    if ask_confirmation; then
+    if ask_confirmation "Execute this command? (y/N): "; then
         echo "Executing command..."
         cmd_result=$(eval "$qm_command" 2>&1)
         if [[ $? -eq 0 ]]; then
@@ -486,7 +590,7 @@ function show_menu() {
                 show_disk
                 ;;
             2)
-                show_pcie
+                show_pcie # This now calls the NVIDIA-filtered version
                 ;;
             3)
                 show_usb
